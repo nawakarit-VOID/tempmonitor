@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Nawakarit
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License v3.0.
+
 // Package recorder persists SamplePoints to disk as they arrive, rather than
 // buffering everything in memory until the run ends. This is a direct
 // consequence of the crash-safety discussion: if the machine locks up or

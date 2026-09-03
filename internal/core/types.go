@@ -1,6 +1,6 @@
-// Package core defines the shared data types used across sensors, stress,
-// recorder and gui packages. Keeping these in one place means the standalone
-// mode and the future agent/monitor split can reuse the exact same schema.
+// Copyright (c) 2026 Nawakarit
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License v3.0.
 package core
 
 import "time"
@@ -43,4 +43,10 @@ type TestRunMeta struct {
 	StressCmd  string    `json:"stress_cmd"`
 	StressArgs []string  `json:"stress_args"`
 	EndReason  string    `json:"end_reason,omitempty"` // "completed", "stopped_by_user", "crashed", ""
+
+	// SampleIntervalMs records how frequently telemetry was logged during
+	// this run (user-configurable in the GUI), so samples.csv can be
+	// correctly interpreted later without guessing the sample rate from
+	// timestamp deltas.
+	SampleIntervalMs int64 `json:"sample_interval_ms"`
 }

@@ -1,15 +1,6 @@
-// Package gui implements the Fyne-based standalone UI: start/stop a
-// stress-ng run, show live temperature/CPU/mem numbers, draw a simple
-// rolling line chart, and hand samples off to the recorder.
-//
-// NOTE: this package depends on fyne.io/fyne/v2, which could not be fetched
-// in the sandbox this project was authored in (network egress there blocks
-// fyne.io and golang.org, which Fyne's module resolution needs). The code
-// below is written to Fyne v2's documented API but has NOT been
-// build-tested in this environment. Run `go mod tidy` on your actual Arch
-// Linux machine (which has normal internet access) to fetch dependencies,
-// then `go build ./...` to confirm — see the README for exact steps and
-// likely first-build issues (Arch system packages needed for CGO/GL).
+// Copyright (c) 2026 Nawakarit
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License v3.0.
 package gui
 
 import (
@@ -33,13 +24,27 @@ import (
 )
 
 const (
-	sampleInterval = 100 * time.Millisecond
-	uiRefreshEvery = 3 // update the UI every Nth sample (~3Hz), per the earlier
-	// discussion: log at 10Hz but redraw at a much lower rate since a human
-	// can't perceive 10Hz UI updates and redrawing that often just burns
-	// CPU on the GUI thread for no benefit.
-	maxChartPoints = 300 // ~100s of history at the UI refresh rate below; older points scroll off
-	dataBaseDir    = "tempmonitor-data"
+	defaultSampleInterval = 100 * time.Millisecond
+	// minSampleInterval is a safety floor: below this, per-tick overhead
+	// (mutex lock, CSV row write, channel/goroutine scheduling) starts to
+	// dominate and the "sampling shouldn't load the CPU" property from the
+	// original design discussion stops holding. 10ms (100Hz) is already far
+	// beyond what's useful for thermal/stability monitoring.
+	minSampleInterval = 10 * time.Millisecond
+	// maxSampleInterval caps how sparse logging can go from the UI — beyond
+	// 10s a "live" chart isn't very live anymore. Someone who genuinely wants
+	// sparser logging than that can post-process the CSV instead.
+	maxSampleInterval = 10 * time.Second
+
+	uiRefreshTarget = 300 * time.Millisecond // redraw the UI at ~3Hz regardless
+	// of sampling rate — a human can't perceive faster updates, and redrawing
+	// is far more expensive than a sensor read (see the design chat).
+
+	targetChartWindow = 60 * time.Second // how much history the chart aims to show
+	minChartPoints    = 50               // floor so a fast interval doesn't leave the chart empty-looking
+	maxChartPoints    = 2000             // ceiling so a very short interval doesn't spam thousands of canvas.Line objects
+
+	dataBaseDir = "tempmonitor-data"
 )
 
 // App holds all long-lived state for the standalone GUI.
@@ -50,10 +55,11 @@ type App struct {
 	sampler *sensors.Sampler
 	runner  *stress.Runner
 
-	mu         sync.Mutex
-	rec        *recorder.Recorder
-	history    []core.SamplePoint // ring-ish buffer, capped at maxChartPoints
-	sampleTick int
+	mu            sync.Mutex
+	rec           *recorder.Recorder
+	history       []core.SamplePoint // ring-ish buffer, capped at maxChartPointsForRun
+	sampleTick    int
+	maxHistPoints int // computed per-run from the chosen interval
 
 	// UI widgets updated from the sampling loop.
 	cpuLabel   *widget.Label
@@ -63,6 +69,7 @@ type App struct {
 	startBtn   *widget.Button
 	stopBtn    *widget.Button
 	durationEn *widget.Entry
+	intervalEn *widget.Entry
 	chart      *chartWidget
 
 	stopSampling chan struct{}
@@ -105,6 +112,10 @@ func (a *App) buildUI() {
 	a.durationEn.SetText("60")
 	a.durationEn.SetPlaceHolder("Duration (seconds)")
 
+	a.intervalEn = widget.NewEntry()
+	a.intervalEn.SetText("100")
+	a.intervalEn.SetPlaceHolder("Sample interval (ms)")
+
 	a.startBtn = widget.NewButton("Start Test", a.onStart)
 	a.stopBtn = widget.NewButton("Stop Test", a.onStop)
 	a.stopBtn.Disable()
@@ -114,6 +125,8 @@ func (a *App) buildUI() {
 	controls := container.NewHBox(
 		widget.NewLabel("Duration (s):"),
 		a.durationEn,
+		widget.NewLabel("Interval (ms):"),
+		a.intervalEn,
 		a.startBtn,
 		a.stopBtn,
 	)
@@ -143,6 +156,11 @@ func (a *App) warnAboutUnfinishedRuns() {
 
 func (a *App) onStart() {
 	seconds := parseDurationSeconds(a.durationEn.Text)
+	interval := parseSampleInterval(a.intervalEn.Text)
+	// Reflect back any clamping (e.g. user typed "1" ms, got floored to 10ms)
+	// so the field shows what will actually be used, not what was typed.
+	a.intervalEn.SetText(fmt.Sprintf("%d", interval.Milliseconds()))
+
 	cfg := stress.Config{
 		Duration:         time.Duration(seconds) * time.Second,
 		CPUWorkers:       numCPU(),
@@ -152,10 +170,11 @@ func (a *App) onStart() {
 
 	runID := time.Now().Format("20060102-150405")
 	meta := core.TestRunMeta{
-		RunID:      runID,
-		StartedAt:  time.Now(),
-		StressCmd:  "stress-ng",
-		StressArgs: nil, // filled in by stress.Runner internally; not re-derived here to avoid duplicating arg-building logic
+		RunID:            runID,
+		StartedAt:        time.Now(),
+		StressCmd:        "stress-ng",
+		StressArgs:       nil, // filled in by stress.Runner internally; not re-derived here to avoid duplicating arg-building logic
+		SampleIntervalMs: interval.Milliseconds(),
 	}
 
 	rec, err := recorder.New(dataBaseDir, meta, a.currentTempLabels())
@@ -174,14 +193,17 @@ func (a *App) onStart() {
 	a.rec = rec
 	a.history = nil
 	a.sampleTick = 0
+	a.maxHistPoints = clampInt(int(targetChartWindow/interval), minChartPoints, maxChartPoints)
 	a.mu.Unlock()
 
 	a.startBtn.Disable()
 	a.stopBtn.Enable()
+	a.durationEn.Disable()
+	a.intervalEn.Disable()
 	a.statusLbl.SetText("Status: running (run " + runID + ")")
 
 	a.stopSampling = make(chan struct{})
-	go a.samplingLoop(a.stopSampling)
+	go a.samplingLoop(a.stopSampling, interval)
 	go a.watchRunnerCompletion()
 }
 
@@ -227,15 +249,20 @@ func (a *App) watchRunnerCompletion() {
 
 	a.startBtn.Enable()
 	a.stopBtn.Disable()
+	a.durationEn.Enable()
+	a.intervalEn.Enable()
 	a.statusLbl.SetText("Status: " + reason)
 }
 
-// samplingLoop is the 10Hz hot loop: sample sensors, write every point to
-// the recorder immediately, and update the UI only every uiRefreshEvery-th
-// tick — see the constants' comments for why sampling and UI rates are
-// decoupled.
-func (a *App) samplingLoop(stop <-chan struct{}) {
-	t := time.NewTicker(sampleInterval)
+// samplingLoop is the hot loop: sample sensors at the given interval, write
+// every point to the recorder immediately, and update the UI only every
+// uiRefreshEvery-th tick — see the constants' comments for why sampling and
+// UI rates are decoupled. uiRefreshEvery is derived from interval so the UI
+// stays at roughly uiRefreshTarget regardless of how fast/slow logging runs.
+func (a *App) samplingLoop(stop <-chan struct{}, interval time.Duration) {
+	uiRefreshEvery := clampInt(int(uiRefreshTarget/interval), 1, 1<<30)
+
+	t := time.NewTicker(interval)
 	defer t.Stop()
 
 	for {
@@ -252,10 +279,11 @@ func (a *App) samplingLoop(stop <-chan struct{}) {
 			rec := a.rec
 			a.sampleTick++
 			tick := a.sampleTick
+			maxPts := a.maxHistPoints
 			if rec != nil {
 				a.history = append(a.history, point)
-				if len(a.history) > maxChartPoints {
-					a.history = a.history[len(a.history)-maxChartPoints:]
+				if maxPts > 0 && len(a.history) > maxPts {
+					a.history = a.history[len(a.history)-maxPts:]
 				}
 			}
 			a.mu.Unlock()
@@ -321,6 +349,37 @@ func parseDurationSeconds(s string) int {
 		return 60 // sane default if the entry field has garbage in it
 	}
 	return n
+}
+
+// parseSampleInterval reads the user's requested interval in milliseconds
+// and clamps it to [minSampleInterval, maxSampleInterval]. Garbage or
+// missing input falls back to defaultSampleInterval rather than erroring —
+// consistent with parseDurationSeconds's approach of "never block Start on
+// a malformed number field, just use something sane."
+func parseSampleInterval(s string) time.Duration {
+	var ms int
+	_, err := fmt.Sscanf(s, "%d", &ms)
+	if err != nil || ms <= 0 {
+		return defaultSampleInterval
+	}
+	d := time.Duration(ms) * time.Millisecond
+	if d < minSampleInterval {
+		return minSampleInterval
+	}
+	if d > maxSampleInterval {
+		return maxSampleInterval
+	}
+	return d
+}
+
+func clampInt(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
 }
 
 func numCPU() int {
