@@ -1,6 +1,28 @@
 // Copyright (c) 2026 Nawakarit
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License v3.0.
+
+// Package gui implements the Fyne-based standalone UI. Monitoring (sampling
+// sensors + recording to disk) and the stress-ng load ("make the CPU busy")
+// are deliberately two independent controls rather than one combined
+// Start/Stop:
+//
+//   - You can start monitoring on its own to capture an idle baseline before
+//     applying any load.
+//   - You can start the stress load without monitoring running, if you just
+//     want to heat the machine up without caring about a CSV of it.
+//   - Most commonly, start monitoring first, then start the stress load —
+//     the recording keeps running for as long as you leave it on, capturing
+//     both the idle period and the loaded period in one continuous CSV.
+//
+// NOTE: this package depends on fyne.io/fyne/v2, which could not be fetched
+// in the sandbox this project was authored in (network egress there blocks
+// fyne.io and golang.org, which Fyne's module resolution needs). The code
+// below is written to Fyne v2's documented API but has NOT been
+// build-tested in this environment. Run `go mod tidy` on your actual Arch
+// Linux machine (which has normal internet access) to fetch dependencies,
+// then `go build ./...` to confirm — see the README for exact steps and
+// likely first-build issues (Arch system packages needed for CGO/GL).
 package gui
 
 import (
@@ -56,23 +78,29 @@ type App struct {
 	runner  *stress.Runner
 
 	mu            sync.Mutex
+	monitoring    bool
 	rec           *recorder.Recorder
-	history       []core.SamplePoint // ring-ish buffer, capped at maxChartPointsForRun
+	history       []core.SamplePoint // ring-ish buffer, capped at maxHistPoints
 	sampleTick    int
-	maxHistPoints int // computed per-run from the chosen interval
+	maxHistPoints int // computed when monitoring starts, from the chosen interval
+	stopSampling  chan struct{}
 
-	// UI widgets updated from the sampling loop.
-	cpuLabel   *widget.Label
-	memLabel   *widget.Label
-	tempLabel  *widget.Label
-	statusLbl  *widget.Label
-	startBtn   *widget.Button
-	stopBtn    *widget.Button
+	// UI widgets updated from the sampling loop / button handlers.
+	cpuLabel  *widget.Label
+	memLabel  *widget.Label
+	tempLabel *widget.Label
+
+	monitorStatusLbl *widget.Label
+	stressStatusLbl  *widget.Label
+
+	startMonitorBtn *widget.Button
+	stopMonitorBtn  *widget.Button
+	startStressBtn  *widget.Button
+	stopStressBtn   *widget.Button
+
 	durationEn *widget.Entry
 	intervalEn *widget.Entry
 	chart      *chartWidget
-
-	stopSampling chan struct{}
 }
 
 // Run builds and shows the main window, blocking until it's closed. Call
@@ -93,7 +121,7 @@ func Run() {
 	a.buildUI()
 	a.warnAboutUnfinishedRuns()
 
-	a.win.Resize(fyne.NewSize(720, 520))
+	a.win.Resize(fyne.NewSize(720, 560))
 	a.win.ShowAndRun()
 }
 
@@ -106,35 +134,46 @@ func (a *App) buildUI() {
 	} else {
 		a.tempLabel.SetText("Temps: no sensors found — try running as root, or check lm-sensors setup")
 	}
-	a.statusLbl = widget.NewLabel("Status: idle")
-
-	a.durationEn = widget.NewEntry()
-	a.durationEn.SetText("60")
-	a.durationEn.SetPlaceHolder("Duration (seconds)")
+	a.monitorStatusLbl = widget.NewLabel("Monitoring: idle")
+	a.stressStatusLbl = widget.NewLabel("Stress load: idle")
 
 	a.intervalEn = widget.NewEntry()
 	a.intervalEn.SetText("100")
 	a.intervalEn.SetPlaceHolder("Sample interval (ms)")
 
-	a.startBtn = widget.NewButton("Start Test", a.onStart)
-	a.stopBtn = widget.NewButton("Stop Test", a.onStop)
-	a.stopBtn.Disable()
+	a.durationEn = widget.NewEntry()
+	a.durationEn.SetText("60")
+	a.durationEn.SetPlaceHolder("Duration (seconds)")
+
+	a.startMonitorBtn = widget.NewButton("Start Monitoring", a.onStartMonitor)
+	a.stopMonitorBtn = widget.NewButton("Stop Monitoring", a.onStopMonitor)
+	a.stopMonitorBtn.Disable()
+
+	a.startStressBtn = widget.NewButton("Start Stress Load", a.onStartStress)
+	a.stopStressBtn = widget.NewButton("Stop Stress Load", a.onStopStress)
+	a.stopStressBtn.Disable()
 
 	a.chart = newChartWidget()
 
-	controls := container.NewHBox(
-		widget.NewLabel("Duration (s):"),
-		a.durationEn,
+	monitorControls := container.NewHBox(
 		widget.NewLabel("Interval (ms):"),
 		a.intervalEn,
-		a.startBtn,
-		a.stopBtn,
+		a.startMonitorBtn,
+		a.stopMonitorBtn,
+		a.monitorStatusLbl,
+	)
+	stressControls := container.NewHBox(
+		widget.NewLabel("Duration (s):"),
+		a.durationEn,
+		a.startStressBtn,
+		a.stopStressBtn,
+		a.stressStatusLbl,
 	)
 
-	readouts := container.NewVBox(a.cpuLabel, a.memLabel, a.tempLabel, a.statusLbl)
+	readouts := container.NewVBox(a.cpuLabel, a.memLabel, a.tempLabel)
 
 	content := container.NewBorder(
-		container.NewVBox(controls, readouts),
+		container.NewVBox(monitorControls, stressControls, readouts),
 		nil, nil, nil,
 		container.NewPadded(a.chart),
 	)
@@ -154,26 +193,25 @@ func (a *App) warnAboutUnfinishedRuns() {
 	dialog.ShowInformation("Unfinished runs detected", msg, a.win)
 }
 
-func (a *App) onStart() {
-	seconds := parseDurationSeconds(a.durationEn.Text)
+// --- Monitoring (sample + record) — independent of the stress load ---
+
+func (a *App) onStartMonitor() {
+	a.mu.Lock()
+	if a.monitoring {
+		a.mu.Unlock()
+		return // already running; button should be disabled anyway, but be defensive
+	}
+	a.mu.Unlock()
+
 	interval := parseSampleInterval(a.intervalEn.Text)
 	// Reflect back any clamping (e.g. user typed "1" ms, got floored to 10ms)
 	// so the field shows what will actually be used, not what was typed.
 	a.intervalEn.SetText(fmt.Sprintf("%d", interval.Milliseconds()))
 
-	cfg := stress.Config{
-		Duration:         time.Duration(seconds) * time.Second,
-		CPUWorkers:       numCPU(),
-		VMWorkers:        2,
-		VMBytesPerWorker: "256M",
-	}
-
 	runID := time.Now().Format("20060102-150405")
 	meta := core.TestRunMeta{
 		RunID:            runID,
 		StartedAt:        time.Now(),
-		StressCmd:        "stress-ng",
-		StressArgs:       nil, // filled in by stress.Runner internally; not re-derived here to avoid duplicating arg-building logic
 		SampleIntervalMs: interval.Milliseconds(),
 	}
 
@@ -183,75 +221,52 @@ func (a *App) onStart() {
 		return
 	}
 
-	if err := a.runner.Start(cfg); err != nil {
-		rec.Finish("failed_to_start")
-		dialog.ShowError(err, a.win)
-		return
-	}
+	stopCh := make(chan struct{})
 
 	a.mu.Lock()
 	a.rec = rec
 	a.history = nil
 	a.sampleTick = 0
 	a.maxHistPoints = clampInt(int(targetChartWindow/interval), minChartPoints, maxChartPoints)
+	a.monitoring = true
+	a.stopSampling = stopCh
 	a.mu.Unlock()
 
-	a.startBtn.Disable()
-	a.stopBtn.Enable()
-	a.durationEn.Disable()
+	a.startMonitorBtn.Disable()
+	a.stopMonitorBtn.Enable()
 	a.intervalEn.Disable()
-	a.statusLbl.SetText("Status: running (run " + runID + ")")
+	a.monitorStatusLbl.SetText("Monitoring: running (run " + runID + ")")
 
-	a.stopSampling = make(chan struct{})
-	go a.samplingLoop(a.stopSampling, interval)
-	go a.watchRunnerCompletion()
+	go a.samplingLoop(stopCh, interval)
 }
 
-func (a *App) onStop() {
-	if err := a.runner.Stop(); err != nil {
-		log.Printf("stop request: %v", err)
-	}
-	// samplingLoop and watchRunnerCompletion detect the resulting status
-	// change and finalize everything; nothing else to do here synchronously
-	// so the UI doesn't block while stress-ng tears down.
-}
-
-// watchRunnerCompletion blocks on runner.Wait() and finalizes the recording
-// once stress-ng exits, whether that's a natural timeout, a user-requested
-// stop, or an unexpected crash of stress-ng itself.
-func (a *App) watchRunnerCompletion() {
-	waitErr := a.runner.Wait()
-
-	reason := "completed"
-	switch a.runner.Status() {
-	case stress.StatusFailed:
-		reason = "stress_process_error"
-	case stress.StatusFinished:
-		reason = "completed"
-	}
-	if waitErr != nil {
-		log.Printf("stress-ng exited with error: %v", waitErr)
-	}
-
-	if a.stopSampling != nil {
-		close(a.stopSampling)
-	}
-
+func (a *App) onStopMonitor() {
 	a.mu.Lock()
+	if !a.monitoring {
+		a.mu.Unlock()
+		return
+	}
+	stopCh := a.stopSampling
 	rec := a.rec
+	a.monitoring = false
+	a.rec = nil
 	a.mu.Unlock()
 
+	close(stopCh)
+
+	// Note: this only stops monitoring/recording. If the stress load is
+	// still running, it keeps running independently — Stop Stress Load is
+	// what controls that. This is intentional: the two are decoupled.
 	if rec != nil {
-		if err := rec.Finish(reason); err != nil {
+		if err := rec.Finish("stopped_by_user"); err != nil {
 			log.Printf("finishing recorder: %v", err)
 		}
 	}
 
-	a.startBtn.Enable()
-	a.stopBtn.Disable()
-	a.durationEn.Enable()
+	a.startMonitorBtn.Enable()
+	a.stopMonitorBtn.Disable()
 	a.intervalEn.Enable()
-	a.statusLbl.SetText("Status: " + reason)
+	a.monitorStatusLbl.SetText("Monitoring: stopped")
 }
 
 // samplingLoop is the hot loop: sample sensors at the given interval, write
@@ -259,6 +274,11 @@ func (a *App) watchRunnerCompletion() {
 // uiRefreshEvery-th tick — see the constants' comments for why sampling and
 // UI rates are decoupled. uiRefreshEvery is derived from interval so the UI
 // stays at roughly uiRefreshTarget regardless of how fast/slow logging runs.
+//
+// This loop runs purely off the monitoring on/off state — it has no idea
+// whether a stress load is currently applying pressure or not, which is
+// exactly the point: it logs whatever the machine is actually doing,
+// whether that's idle or under load.
 func (a *App) samplingLoop(stop <-chan struct{}, interval time.Duration) {
 	uiRefreshEvery := clampInt(int(uiRefreshTarget/interval), 1, 1<<30)
 
@@ -318,7 +338,7 @@ func (a *App) refreshUI(latest core.SamplePoint) {
 
 func (a *App) currentTempLabels() []string {
 	// Take one sample up front purely to discover which sensor labels exist
-	// so the CSV header can be fixed before the run starts. This sample's
+	// so the CSV header can be fixed before recording starts. This sample's
 	// values are thrown away (not written to the recorder) — its only job
 	// is to populate the label set.
 	point, _ := a.sampler.Sample()
@@ -328,6 +348,69 @@ func (a *App) currentTempLabels() []string {
 	}
 	sort.Strings(labels)
 	return labels
+}
+
+// --- Stress load (stress-ng) — independent of monitoring ---
+
+func (a *App) onStartStress() {
+	if a.runner.Status() == stress.StatusRunning || a.runner.Status() == stress.StatusStopping {
+		return // already running; button should be disabled anyway, but be defensive
+	}
+
+	seconds := parseDurationSeconds(a.durationEn.Text)
+	cfg := stress.Config{
+		Duration:         time.Duration(seconds) * time.Second,
+		CPUWorkers:       numCPU(),
+		VMWorkers:        2,
+		VMBytesPerWorker: "256M",
+	}
+
+	if err := a.runner.Start(cfg); err != nil {
+		dialog.ShowError(err, a.win)
+		return
+	}
+
+	a.startStressBtn.Disable()
+	a.stopStressBtn.Enable()
+	a.durationEn.Disable()
+	a.stressStatusLbl.SetText("Stress load: running")
+
+	go a.watchStressCompletion()
+}
+
+func (a *App) onStopStress() {
+	if err := a.runner.Stop(); err != nil {
+		log.Printf("stop request: %v", err)
+	}
+	// watchStressCompletion (already running in the background since
+	// onStartStress) detects the resulting status change and updates the
+	// UI; nothing else to do here synchronously so the UI doesn't block
+	// while stress-ng tears down.
+}
+
+// watchStressCompletion blocks on runner.Wait() and updates the stress
+// controls once stress-ng exits, whether that's a natural timeout, a
+// user-requested stop, or an unexpected crash of stress-ng itself. It does
+// NOT touch the recorder — monitoring has its own independent lifecycle,
+// controlled only by Start/Stop Monitoring.
+func (a *App) watchStressCompletion() {
+	waitErr := a.runner.Wait()
+
+	status := "finished"
+	switch a.runner.Status() {
+	case stress.StatusFailed:
+		status = "error"
+	case stress.StatusFinished:
+		status = "finished"
+	}
+	if waitErr != nil {
+		log.Printf("stress-ng exited with error: %v", waitErr)
+	}
+
+	a.startStressBtn.Enable()
+	a.stopStressBtn.Disable()
+	a.durationEn.Enable()
+	a.stressStatusLbl.SetText("Stress load: " + status)
 }
 
 func hottest(temps map[string]float64) (string, float64) {
