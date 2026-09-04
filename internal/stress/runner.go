@@ -1,12 +1,14 @@
 // Copyright (c) 2026 Nawakarit
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License v3.0.
+
 // Package stress wraps the external stress-ng tool as a controllable,
 // cancellable subprocess. Chosen over reimplementing load generation in Go
 // because stress-ng already has a decade of well-tested, tunable stressors
 // (cpu, matrix, vm, io, ...) — reinventing that would add risk without
 // adding value for this project's goal, which is measuring thermal/stability
 // behavior under load, not building a new load generator.
+
 package stress
 
 import (

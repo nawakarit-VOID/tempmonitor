@@ -1,11 +1,13 @@
 // Copyright (c) 2026 Nawakarit
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License v3.0.
+
 // Package sensors reads temperature, CPU and memory telemetry straight from
 // the Linux kernel's sysfs/procfs interfaces. Deliberately avoids shelling
 // out to external tools (sensors, nvidia-smi, etc.) for the hot path so that
 // polling at high frequency (e.g. every 100ms) stays cheap — each read is a
 // handful of small file opens, no process spawn.
+
 package sensors
 
 import (
