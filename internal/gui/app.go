@@ -62,10 +62,6 @@ const (
 	// of sampling rate — a human can't perceive faster updates, and redrawing
 	// is far more expensive than a sensor read (see the design chat).
 
-	targetChartWindow = 60 * time.Second // how much history the chart aims to show
-	minChartPoints    = 50               // floor so a fast interval doesn't leave the chart empty-looking
-	maxChartPoints    = 2000             // ceiling so a very short interval doesn't spam thousands of canvas.Line objects
-
 	dataBaseDir = "tempmonitor-data"
 )
 
@@ -77,13 +73,11 @@ type App struct {
 	sampler *sensors.Sampler
 	runner  *stress.Runner
 
-	mu            sync.Mutex
-	monitoring    bool
-	rec           *recorder.Recorder
-	history       []core.SamplePoint // ring-ish buffer, capped at maxHistPoints
-	sampleTick    int
-	maxHistPoints int // computed when monitoring starts, from the chosen interval
-	stopSampling  chan struct{}
+	mu           sync.Mutex
+	monitoring   bool
+	rec          *recorder.Recorder
+	sampleTick   int
+	stopSampling chan struct{}
 
 	// UI widgets updated from the sampling loop / button handlers.
 	cpuLabel  *widget.Label
@@ -100,7 +94,6 @@ type App struct {
 
 	durationEn *widget.Entry
 	intervalEn *widget.Entry
-	chart      *chartWidget
 }
 
 // Run builds and shows the main window, blocking until it's closed. Call
@@ -121,7 +114,7 @@ func Run() {
 	a.buildUI()
 	a.warnAboutUnfinishedRuns()
 
-	a.win.Resize(fyne.NewSize(720, 560))
+	a.win.Resize(fyne.NewSize(720, 260))
 	a.win.ShowAndRun()
 }
 
@@ -153,8 +146,6 @@ func (a *App) buildUI() {
 	a.stopStressBtn = widget.NewButton("Stop Stress Load", a.onStopStress)
 	a.stopStressBtn.Disable()
 
-	a.chart = newChartWidget()
-
 	monitorControls := container.NewHBox(
 		widget.NewLabel("Interval (ms):"),
 		a.intervalEn,
@@ -172,11 +163,7 @@ func (a *App) buildUI() {
 
 	readouts := container.NewVBox(a.cpuLabel, a.memLabel, a.tempLabel)
 
-	content := container.NewBorder(
-		container.NewVBox(monitorControls, stressControls, readouts),
-		nil, nil, nil,
-		container.NewPadded(a.chart),
-	)
+	content := container.NewVBox(monitorControls, stressControls, readouts)
 	a.win.SetContent(content)
 }
 
@@ -225,9 +212,7 @@ func (a *App) onStartMonitor() {
 
 	a.mu.Lock()
 	a.rec = rec
-	a.history = nil
 	a.sampleTick = 0
-	a.maxHistPoints = clampInt(int(targetChartWindow/interval), minChartPoints, maxChartPoints)
 	a.monitoring = true
 	a.stopSampling = stopCh
 	a.mu.Unlock()
@@ -299,13 +284,6 @@ func (a *App) samplingLoop(stop <-chan struct{}, interval time.Duration) {
 			rec := a.rec
 			a.sampleTick++
 			tick := a.sampleTick
-			maxPts := a.maxHistPoints
-			if rec != nil {
-				a.history = append(a.history, point)
-				if maxPts > 0 && len(a.history) > maxPts {
-					a.history = a.history[len(a.history)-maxPts:]
-				}
-			}
 			a.mu.Unlock()
 
 			if rec != nil {
@@ -329,11 +307,6 @@ func (a *App) refreshUI(latest core.SamplePoint) {
 		hottestLabel, hottestVal := hottest(latest.TempsC)
 		a.tempLabel.SetText(fmt.Sprintf("Hottest: %s = %.1f°C (%d sensors)", hottestLabel, hottestVal, len(latest.TempsC)))
 	}
-
-	a.mu.Lock()
-	histCopy := append([]core.SamplePoint(nil), a.history...)
-	a.mu.Unlock()
-	a.chart.SetData(histCopy)
 }
 
 func (a *App) currentTempLabels() []string {
