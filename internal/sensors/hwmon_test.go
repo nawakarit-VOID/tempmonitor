@@ -41,3 +41,36 @@ func TestLabelFor_FallsBackToIndexWithoutLabelFile(t *testing.T) {
 		t.Errorf("labelFor() = %q, want %q", got, want)
 	}
 }
+
+func TestSampler_TempLabelsDoesNotAffectCPUTracker(t *testing.T) {
+	s, err := NewSampler()
+	if err != nil {
+		t.Fatalf("NewSampler() error = %v", err)
+	}
+
+	// Calling TempLabels() any number of times must not consume the CPU
+	// tracker's "first sample" warm-up, unlike Sample() which does.
+	_ = s.TempLabels()
+	_ = s.TempLabels()
+	_ = s.TempLabels()
+
+	first, err := s.Sample()
+	if err != nil {
+		t.Fatalf("Sample() error = %v", err)
+	}
+	if first.CPUUsagePercent != 0 {
+		t.Errorf("first Sample() after TempLabels() calls should still report 0%% CPU (no prior delta), got %v", first.CPUUsagePercent)
+	}
+
+	labels := s.TempLabels()
+	if labels == nil {
+		t.Error("TempLabels() returned nil, want non-nil (possibly empty) slice")
+	}
+	// Labels should be sorted.
+	for i := 1; i < len(labels); i++ {
+		if labels[i-1] > labels[i] {
+			t.Errorf("TempLabels() not sorted: %v", labels)
+			break
+		}
+	}
+}

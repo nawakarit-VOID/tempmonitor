@@ -7,7 +7,6 @@
 // consequence of the crash-safety discussion: if the machine locks up or
 // reboots mid-test, only the last fsync interval's worth of data (at most)
 // is lost, instead of the entire run.
-
 package recorder
 
 import (

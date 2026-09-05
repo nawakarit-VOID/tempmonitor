@@ -15,6 +15,10 @@
 //     the recording keeps running for as long as you leave it on, capturing
 //     both the idle period and the loaded period in one continuous CSV.
 //
+// The UI shows current CPU/memory/temperature readouts as plain text labels
+// only — there is intentionally no live chart. All the data still goes into
+// samples.csv for later graphing/analysis in whatever tool you prefer.
+//
 // NOTE: this package depends on fyne.io/fyne/v2, which could not be fetched
 // in the sandbox this project was authored in (network egress there blocks
 // fyne.io and golang.org, which Fyne's module resolution needs). The code
@@ -29,7 +33,6 @@ import (
 	"fmt"
 	"log"
 	"runtime"
-	"sort"
 	"sync"
 	"time"
 
@@ -80,9 +83,16 @@ type App struct {
 	stopSampling chan struct{}
 
 	// UI widgets updated from the sampling loop / button handlers.
-	cpuLabel  *widget.Label
-	memLabel  *widget.Label
-	tempLabel *widget.Label
+	cpuLabel *widget.Label
+	memLabel *widget.Label
+
+	// tempRowLabels is the fixed, sorted list of sensor labels discovered at
+	// startup (e.g. "coretemp:Package id 0"); tempValueLabels holds one
+	// *widget.Label per row, in the same order, whose text gets updated
+	// every UI refresh. Both are nil/empty if no sensors were found.
+	tempRowLabels   []string
+	tempValueLabels []*widget.Label
+	noSensorsLbl    *widget.Label
 
 	monitorStatusLbl *widget.Label
 	stressStatusLbl  *widget.Label
@@ -114,21 +124,17 @@ func Run() {
 	a.buildUI()
 	a.warnAboutUnfinishedRuns()
 
-	a.win.Resize(fyne.NewSize(720, 260))
+	a.win.Resize(fyne.NewSize(720, 480))
 	a.win.ShowAndRun()
 }
 
 func (a *App) buildUI() {
 	a.cpuLabel = widget.NewLabel("CPU: --")
 	a.memLabel = widget.NewLabel("Mem: --")
-	a.tempLabel = widget.NewLabel("Temps: -- (0 sensors found)")
-	if n := a.sampler.TempSensorCount(); n > 0 {
-		a.tempLabel.SetText(fmt.Sprintf("Temps: -- (%d sensors found)", n))
-	} else {
-		a.tempLabel.SetText("Temps: no sensors found — try running as root, or check lm-sensors setup")
-	}
 	a.monitorStatusLbl = widget.NewLabel("Monitoring: idle")
 	a.stressStatusLbl = widget.NewLabel("Stress load: idle")
+
+	tempTable := a.buildTempTable()
 
 	a.intervalEn = widget.NewEntry()
 	a.intervalEn.SetText("100")
@@ -161,10 +167,46 @@ func (a *App) buildUI() {
 		a.stressStatusLbl,
 	)
 
-	readouts := container.NewVBox(a.cpuLabel, a.memLabel, a.tempLabel)
+	readouts := container.NewVBox(a.cpuLabel, a.memLabel)
 
-	content := container.NewVBox(monitorControls, stressControls, readouts)
+	content := container.NewVBox(monitorControls, stressControls, readouts, tempTable)
 	a.win.SetContent(content)
+}
+
+// buildTempTable discovers every temperature sensor once at startup and
+// builds one row per sensor (name on the left, live value on the right),
+// listed top-to-bottom in a fixed order. It's a plain stack of two-column
+// grids rather than Fyne's widget.Table — simpler to reason about for a
+// small, fixed row count like this, and avoids that widget's virtualized
+// sizing quirks for a first pass. Returns a single CanvasObject ready to
+// drop into the window's layout.
+func (a *App) buildTempTable() fyne.CanvasObject {
+	a.tempRowLabels = a.sampler.TempLabels()
+
+	if len(a.tempRowLabels) == 0 {
+		a.noSensorsLbl = widget.NewLabel("No temperature sensors found — try running as root, or check lm-sensors setup")
+		return a.noSensorsLbl
+	}
+
+	rows := make([]fyne.CanvasObject, 0, len(a.tempRowLabels)+1)
+
+	header := container.NewGridWithColumns(2,
+		widget.NewLabel("Sensor"),
+		widget.NewLabel("Temp (°C)"),
+	)
+	rows = append(rows, header)
+
+	a.tempValueLabels = make([]*widget.Label, len(a.tempRowLabels))
+	for i, label := range a.tempRowLabels {
+		valueLbl := widget.NewLabel("--")
+		a.tempValueLabels[i] = valueLbl
+		rows = append(rows, container.NewGridWithColumns(2,
+			widget.NewLabel(label),
+			valueLbl,
+		))
+	}
+
+	return container.NewVBox(rows...)
 }
 
 func (a *App) warnAboutUnfinishedRuns() {
@@ -202,7 +244,7 @@ func (a *App) onStartMonitor() {
 		SampleIntervalMs: interval.Milliseconds(),
 	}
 
-	rec, err := recorder.New(dataBaseDir, meta, a.currentTempLabels())
+	rec, err := recorder.New(dataBaseDir, meta, a.tempRowLabels)
 	if err != nil {
 		dialog.ShowError(fmt.Errorf("could not start recording: %w", err), a.win)
 		return
@@ -303,24 +345,13 @@ func (a *App) refreshUI(latest core.SamplePoint) {
 	a.cpuLabel.SetText(fmt.Sprintf("CPU: %.1f%%", latest.CPUUsagePercent))
 	a.memLabel.SetText(fmt.Sprintf("Mem: %.0f/%.0f MB (%.1f%%)", float64(latest.MemUsedMB), float64(latest.MemTotalMB), latest.MemUsagePct))
 
-	if len(latest.TempsC) > 0 {
-		hottestLabel, hottestVal := hottest(latest.TempsC)
-		a.tempLabel.SetText(fmt.Sprintf("Hottest: %s = %.1f°C (%d sensors)", hottestLabel, hottestVal, len(latest.TempsC)))
+	for i, label := range a.tempRowLabels {
+		if v, ok := latest.TempsC[label]; ok {
+			a.tempValueLabels[i].SetText(fmt.Sprintf("%.1f", v))
+		} else {
+			a.tempValueLabels[i].SetText("--") // sensor missing this tick
+		}
 	}
-}
-
-func (a *App) currentTempLabels() []string {
-	// Take one sample up front purely to discover which sensor labels exist
-	// so the CSV header can be fixed before recording starts. This sample's
-	// values are thrown away (not written to the recorder) — its only job
-	// is to populate the label set.
-	point, _ := a.sampler.Sample()
-	labels := make([]string, 0, len(point.TempsC))
-	for l := range point.TempsC {
-		labels = append(labels, l)
-	}
-	sort.Strings(labels)
-	return labels
 }
 
 // --- Stress load (stress-ng) — independent of monitoring ---
@@ -384,18 +415,6 @@ func (a *App) watchStressCompletion() {
 	a.stopStressBtn.Disable()
 	a.durationEn.Enable()
 	a.stressStatusLbl.SetText("Stress load: " + status)
-}
-
-func hottest(temps map[string]float64) (string, float64) {
-	var bestLabel string
-	var bestVal float64 = -1
-	for l, v := range temps {
-		if v > bestVal {
-			bestVal = v
-			bestLabel = l
-		}
-	}
-	return bestLabel, bestVal
 }
 
 func parseDurationSeconds(s string) int {

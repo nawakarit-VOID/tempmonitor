@@ -7,7 +7,6 @@
 // out to external tools (sensors, nvidia-smi, etc.) for the hot path so that
 // polling at high frequency (e.g. every 100ms) stays cheap — each read is a
 // handful of small file opens, no process spawn.
-
 package sensors
 
 import (

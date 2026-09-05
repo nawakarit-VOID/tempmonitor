@@ -5,6 +5,7 @@
 package sensors
 
 import (
+	"sort"
 	"time"
 
 	"tempmonitor/internal/core"
@@ -37,6 +38,22 @@ func NewSampler() (*Sampler, error) {
 // callers can warn the user up front if it's zero.
 func (s *Sampler) TempSensorCount() int {
 	return s.temps.Count()
+}
+
+// TempLabels returns the sorted list of all discovered temperature sensor
+// labels (e.g. "coretemp:Package id 0"), useful for a caller that wants to
+// build a fixed table/CSV header before the first real sample is taken.
+// Unlike Sample(), this does not touch the CPU usage tracker's internal
+// state, so it's safe to call as many times as needed (e.g. once at GUI
+// startup to build a table) without affecting the delta-based CPU% math.
+func (s *Sampler) TempLabels() []string {
+	m := s.temps.Read()
+	labels := make([]string, 0, len(m))
+	for l := range m {
+		labels = append(labels, l)
+	}
+	sort.Strings(labels)
+	return labels
 }
 
 // Sample takes one snapshot of all available telemetry. Errors reading

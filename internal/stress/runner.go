@@ -8,7 +8,6 @@
 // (cpu, matrix, vm, io, ...) — reinventing that would add risk without
 // adding value for this project's goal, which is measuring thermal/stability
 // behavior under load, not building a new load generator.
-
 package stress
 
 import (
