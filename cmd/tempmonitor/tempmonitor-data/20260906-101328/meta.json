@@ -1,0 +1,9 @@
+{
+  "run_id": "20260906-101328",
+  "started_at": "2026-09-06T10:13:28.172359118+07:00",
+  "stopped_at": "2026-09-06T10:13:37.739214923+07:00",
+  "stress_cmd": "",
+  "stress_args": null,
+  "end_reason": "stopped_by_user",
+  "sample_interval_ms": 100
+}
