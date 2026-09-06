@@ -143,6 +143,16 @@ func (r *Recorder) Write(p core.SamplePoint) error {
 	return r.csvw.Write(row)
 }
 
+// Dir returns the run directory this recorder is writing into (e.g.
+// "tempmonitor-data/20260101-120000"), useful for a caller that wants to
+// act on this run's files directly — for example, generating an HTML
+// report from the currently-active run without waiting for Finish().
+func (r *Recorder) Dir() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.dir
+}
+
 // Flush pushes buffered CSV data to the OS and fsyncs the file to disk.
 // Called automatically every flushInterval, but exposed for callers that
 // want an extra flush at a specific moment (e.g. right before Finish).

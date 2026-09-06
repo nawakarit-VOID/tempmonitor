@@ -151,3 +151,18 @@ func TestDetectUnfinishedRuns_EmptyBaseDir(t *testing.T) {
 		t.Errorf("got %d unfinished runs, want 0", len(unfinished))
 	}
 }
+
+func TestRecorder_Dir(t *testing.T) {
+	dir := t.TempDir()
+	meta := core.TestRunMeta{RunID: "dir-test-run", StartedAt: time.Now()}
+	r, err := New(dir, meta, nil)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer r.Finish("completed")
+
+	want := filepath.Join(dir, "dir-test-run")
+	if got := r.Dir(); got != want {
+		t.Errorf("Dir() = %q, want %q", got, want)
+	}
+}

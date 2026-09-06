@@ -32,6 +32,7 @@ package gui
 import (
 	"fmt"
 	"log"
+	"os/exec"
 	"runtime"
 	"sync"
 	"time"
@@ -44,6 +45,7 @@ import (
 
 	"tempmonitor/internal/core"
 	"tempmonitor/internal/recorder"
+	"tempmonitor/internal/report"
 	"tempmonitor/internal/sensors"
 	"tempmonitor/internal/stress"
 )
@@ -101,6 +103,7 @@ type App struct {
 	stopMonitorBtn  *widget.Button
 	startStressBtn  *widget.Button
 	stopStressBtn   *widget.Button
+	openReportBtn   *widget.Button
 
 	durationEn *widget.Entry
 	intervalEn *widget.Entry
@@ -124,7 +127,7 @@ func Run() {
 	a.buildUI()
 	a.warnAboutUnfinishedRuns()
 
-	a.win.Resize(fyne.NewSize(720, 480))
+	a.win.Resize(fyne.NewSize(720, 520))
 	a.win.ShowAndRun()
 }
 
@@ -167,9 +170,12 @@ func (a *App) buildUI() {
 		a.stressStatusLbl,
 	)
 
+	a.openReportBtn = widget.NewButton("Open Report in Browser", a.onOpenReport)
+	reportControls := container.NewHBox(a.openReportBtn)
+
 	readouts := container.NewVBox(a.cpuLabel, a.memLabel)
 
-	content := container.NewVBox(monitorControls, stressControls, readouts, tempTable)
+	content := container.NewVBox(monitorControls, stressControls, reportControls, readouts, tempTable)
 	a.win.SetContent(content)
 }
 
@@ -294,6 +300,63 @@ func (a *App) onStopMonitor() {
 	a.stopMonitorBtn.Disable()
 	a.intervalEn.Enable()
 	a.monitorStatusLbl.SetText("Monitoring: stopped")
+}
+
+// --- Report (generate + open the HTML chart in a browser) ---
+
+// onOpenReport generates report.html for the run currently being recorded
+// (if any) or, failing that, the most recently started run under
+// dataBaseDir, then hands it to the OS's default file opener so it lands in
+// the user's browser. Works whether monitoring is still active (report
+// reflects data up to the most recent flush) or already stopped.
+func (a *App) onOpenReport() {
+	a.mu.Lock()
+	activeRec := a.rec
+	a.mu.Unlock()
+
+	var runDir string
+	if activeRec != nil {
+		// Force a flush so the report reflects data up to "now" rather than
+		// only up to the last periodic fsync, which can lag by up to ~1s
+		// (see recorder.flushInterval).
+		if err := activeRec.Flush(); err != nil {
+			log.Printf("flushing before report: %v", err)
+		}
+		runDir = activeRec.Dir()
+	} else {
+		dir, err := report.LatestRunDir(dataBaseDir)
+		if err != nil {
+			dialog.ShowError(fmt.Errorf("could not find a run to report on: %w", err), a.win)
+			return
+		}
+		if dir == "" {
+			dialog.ShowInformation("No data yet", "Start monitoring at least once before opening a report.", a.win)
+			return
+		}
+		runDir = dir
+	}
+
+	path, err := report.Generate(runDir)
+	if err != nil {
+		dialog.ShowError(fmt.Errorf("could not generate report: %w", err), a.win)
+		return
+	}
+
+	if err := openInBrowser(path); err != nil {
+		dialog.ShowError(fmt.Errorf("generated the report at %s but could not open a browser automatically: %w", path, err), a.win)
+	}
+}
+
+// openInBrowser hands path to the desktop's default file opener. xdg-open
+// is the standard cross-desktop way to do this on Linux (works under
+// GNOME, KDE, i3, and everything in between), which matches this project's
+// Arch Linux target — see the README for other platforms if this project
+// is ever run elsewhere.
+func openInBrowser(path string) error {
+	if err := exec.Command("xdg-open", path).Start(); err != nil {
+		return fmt.Errorf("running xdg-open: %w", err)
+	}
+	return nil
 }
 
 // samplingLoop is the hot loop: sample sensors at the given interval, write
