@@ -30,8 +30,10 @@
 package gui
 
 import (
+	"embed"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
 	"runtime"
 	"sync"
@@ -109,13 +111,51 @@ type App struct {
 	intervalEn *widget.Entry
 }
 
+func loadIcon(size int) fyne.Resource {
+	var file string
+
+	switch {
+	case size >= 512:
+		file = "assets/icons/icon-512.png" ///ที่อยู่
+	case size >= 256:
+		file = "assets/icons/icon-256.png"
+	case size >= 128:
+		file = "assets/icons/icon-128.png"
+	default:
+		file = "assets/icons/icon-64.png"
+	}
+
+	data, err := iconFS.ReadFile(file)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: cannot load icon %s: %v\n", file, err)
+		return fyne.NewStaticResource("missing-icon", nil)
+	}
+	if len(data) == 0 {
+		fmt.Fprintf(os.Stderr, "warning: icon %s is empty\n", file)
+		return fyne.NewStaticResource("empty-icon", nil)
+	}
+	return fyne.NewStaticResource(file, data)
+
+}
+
+//go:embed assets/icons/*
+var iconFS embed.FS
+
+//go:embed assets/font/Itim-Regular.ttf
+var fontItim []byte
+var myFont = fyne.NewStaticResource("Itim-Regular.ttf", fontItim)
+
 // Run builds and shows the main window, blocking until it's closed. Call
 // this from main().
+
 func Run() {
-	a := &App{
-		fyneApp: app.New(),
-	}
+	a := &App{fyneApp: app.NewWithID("com.nawakarit.tempmonitor")}
+
 	a.win = a.fyneApp.NewWindow("Temp/Stability Monitor")
+
+	icon := loadIcon(64)
+
+	a.fyneApp.Settings().SetTheme(&MyTheme{})
 
 	var err error
 	a.sampler, err = sensors.NewSampler()
@@ -123,12 +163,12 @@ func Run() {
 		log.Fatalf("failed to initialize sensors: %v", err)
 	}
 	a.runner = stress.NewRunner()
-
 	a.buildUI()
 	a.warnAboutUnfinishedRuns()
-
 	a.win.Resize(fyne.NewSize(720, 520))
 	a.win.ShowAndRun()
+	a.win.SetIcon(icon)
+
 }
 
 func (a *App) buildUI() {
