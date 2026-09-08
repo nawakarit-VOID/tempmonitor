@@ -41,7 +41,7 @@ Fyne uses CGO + OpenGL under the hood, hence `gcc` and the X11/mesa libs.
 cd tempmonitor
 go mod tidy      # fetches Fyne and its dependencies — needs real internet
 go build ./...   # compiles everything, including the GUI
-go run ./cmd/tempmonitor
+go run .
 ```
 
 If `go build` reports errors inside `internal/gui`, that's almost certainly
@@ -57,7 +57,7 @@ go test ./...
 ## Project layout
 
 ```
-cmd/tempmonitor/main.go   entry point, just calls gui.Run()
+main.go                   entry point, just calls gui.Run()
 internal/core/            shared data types (SamplePoint, TestRunMeta)
 internal/sensors/         reads /sys/class/hwmon (temps), /proc/stat (CPU),
                            /proc/meminfo (RAM) — no external commands
